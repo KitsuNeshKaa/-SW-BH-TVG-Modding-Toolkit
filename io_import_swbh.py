@@ -1,13 +1,12 @@
 bl_info = {
     "name": "Star Wars: Bounty Hunter importer",
     "author": "reverse-engineered 2026",
-    "version": (1, 0, 0),
+    "version": (1, 1, 2),
     "blender": (3, 2, 0),
     "location": "File > Import > SW: Bounty Hunter Mesh (.bin) / Level Area "
                 "(.lvt) / Animation (.abin)",
-    "description": "Imports SWBH meshes (including the older gs_world.bin "
-                   "container, auto-detected), skeletons, animations, and "
-                   "whole level areas with lights and actor/prop placement",
+    "description": "Imports SWBH models, animations and whole level areas; resolves "
+                   "materials, textures, shaders and actor data automatically",
     "category": "Import-Export",
 }
 
@@ -33,7 +32,9 @@ from math import radians
 #
 #  HEADER
 #    +0x10  u32   submesh count
-#    +0x1C  u32   -> object name (asciiz)
+#    +0x14  u32   -> per-node matrix array
+#    +0x1C  u32   -> node name/parent array (stride 44)
+#    +0x24  u16   node count
 #    +0x28  u32   -> submesh array
 #    +0x38  4x4   matrix (identity in everything seen so far)
 #
@@ -108,6 +109,16 @@ NODE_STRIDE = 44
 SLOT_SKIN, SLOT_IDX, SLOT_POS, SLOT_NRM, SLOT_UV, SLOT_5, SLOT_COL, SLOT_7 = range(8)
 
 TEX_EXTS = (".dds", ".png", ".tga", ".tif", ".tiff", ".jpg", ".jpeg", ".bmp")
+
+ATS_EXT = ".ats"
+ASET_EXT = ".aset"
+COL_EXT = ".col"
+LVR_EXT = ".lvr"
+
+_ATS_CACHE = {}
+_ASET_CACHE = {}
+_COL_CACHE = {}
+_LVR_CACHE = {}
 
 GENERIC_NAMES = re.compile(r"^(godnode|LgcGeo\d*|VisGeo\d*)$", re.I)
 
@@ -652,24 +663,225 @@ def build_bin_index(root):
     return bins
 
 
-def parse_mat(path):
+def _strip_inline_comment(value):
+    # Comments in ATS/ASET are mostly //, but quoted strings are not used in
+    # the shipped descriptors. Keep this deliberately conservative.
+    if "//" in value:
+        return value.split("//", 1)[0].rstrip()
+    return value.strip()
+
+
+def parse_kv_text(path, allow_equals=True):
+    """Read a simple engine descriptor as a case-preserving key/value dict."""
     out = {}
     try:
-        with open(path, "r", encoding="ascii", errors="replace") as f:
-            for line in f:
-                m = re.match(r"\s*(\w+)\s*:\s*(.+?)\s*$", line)
-                if m:
-                    out[m.group(1).lower()] = m.group(2)
+        with open(path, "r", encoding="latin1", errors="replace") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("//") or line.startswith("/"):
+                    continue
+                if allow_equals and "=" in line:
+                    k, v = line.split("=", 1)
+                elif ":" in line:
+                    k, v = line.split(":", 1)
+                else:
+                    continue
+                k = k.strip()
+                v = _strip_inline_comment(v)
+                if k:
+                    out[k] = v
     except OSError:
         pass
     return out
+
+
+def parse_ats(path):
+    """Parse an ATS actor/template descriptor.
+
+    Values remain strings intentionally: the original files contain a mix of
+    strings, integers, floats, flag strings and symbolic names. Numeric
+    coercion is exposed separately so no information is lost.
+    """
+    path = os.path.abspath(path)
+    if path in _ATS_CACHE:
+        return _ATS_CACHE[path]
+    raw = parse_kv_text(path, allow_equals=True)
+    typed = {}
+    for k, v in raw.items():
+        low = v.strip()
+        if re.fullmatch(r"[-+]?\d+", low):
+            try:
+                typed[k] = int(low)
+                continue
+            except ValueError:
+                pass
+        if re.fullmatch(r"[-+]?(?:\d+\.\d*|\.\d+|\d+\.\d+)(?:[eE][-+]?\d+)?", low):
+            try:
+                typed[k] = float(low)
+                continue
+            except ValueError:
+                pass
+        typed[k] = v
+    out = {"path": path, "raw": raw, "values": typed}
+    _ATS_CACHE[path] = out
+    return out
+
+
+def parse_aset(path):
+    """Parse an ASET animation-set descriptor into named ABIN references."""
+    path = os.path.abspath(path)
+    if path in _ASET_CACHE:
+        return _ASET_CACHE[path]
+    entries = []
+    includes = []
+    try:
+        with open(path, "r", encoding="latin1", errors="replace") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("//") or line.startswith("/"):
+                    continue
+                m = re.match(r"#include\s+\"([^\"]+)\"", line, re.I)
+                if m:
+                    includes.append(m.group(1))
+                    continue
+                m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(\S+)(?:\s+(.+?))?\s*$", line)
+                if not m:
+                    continue
+                name, ref, extra = m.groups()
+                entries.append({"name": name, "path": ref, "extra": extra or ""})
+    except OSError:
+        pass
+    out = {"path": path, "entries": entries, "includes": includes}
+    _ASET_CACHE[path] = out
+    return out
+
+
+def _float3(text):
+    vals = [float(x) for x in text.split()[:3]]
+    return tuple(vals) if len(vals) == 3 else None
+
+
+def parse_col(path):
+    """Parse the text collision format; report an opaque binary variant."""
+    path = os.path.abspath(path)
+    if path in _COL_CACHE:
+        return _COL_CACHE[path]
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return {"path": path, "format": "missing", "boxes": [], "spheres": [], "binary": False}
+    if data.startswith(b"BBOXES:"):
+        text = data.decode("latin1", errors="replace")
+        boxes = []
+        spheres = []
+        dcs = []
+        for line in text.splitlines():
+            line = line.strip()
+            m = re.match(r"BBOX:\s*MIN:\s+([^\s]+\s+[^\s]+\s+[^\s]+)\s+MAX:\s+(.+)$", line, re.I)
+            if m:
+                mn = _float3(m.group(1)); mx = _float3(m.group(2))
+                if mn and mx:
+                    boxes.append({"min": mn, "max": mx})
+                continue
+            m = re.match(r"DCS:\s*(\S+)\s+OFF:\s+([^\n]+?)\s+RAD:\s*([-+\d.eE]+)", line, re.I)
+            if m:
+                off = _float3(m.group(2))
+                if off:
+                    dcs.append({"bone": m.group(1), "offset": off, "radius": float(m.group(3))})
+                continue
+            m = re.match(r"NUMSPHERE:\s*(\d+)", line, re.I)
+            if m:
+                continue
+        out = {"path": path, "format": "text", "boxes": boxes, "spheres": spheres,
+               "dcs": dcs, "binary": False}
+    else:
+        out = {"path": path, "format": "binary", "boxes": [], "spheres": [],
+               "dcs": [], "binary": True, "size": len(data), "header": data[:32].hex(" ")}
+    _COL_CACHE[path] = out
+    return out
+
+
+def parse_lvr(path):
+    """Parse LVR actor placement data, including the first actor block."""
+    path = os.path.abspath(path)
+    if path in _LVR_CACHE:
+        return _LVR_CACHE[path]
+    try:
+        with open(path, "r", encoding="latin1", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return {"version": None, "actors": [], "raw_lines": []}
+    actors = []
+    cur = None
+    for line in lines:
+        m = _LVT_ACTOR_RE.search(line)
+        if m:
+            cur = {
+                "name": m.group(1), "cls": m.group(2),
+                "pos": tuple(float(x) for x in m.groups()[2:5]),
+                "rot": tuple(float(x) for x in m.groups()[5:9]),
+                "id": int(m.group(10)), "flags": int(m.group(11)), "areas": []}
+            actors.append(cur)
+            continue
+        if line.strip().startswith("AREAS:") and cur is not None:
+            cur["areas"] = [int(x) for x in line.split()[1:] if x.lstrip("-").isdigit()]
+    out = {"version": lines[0].strip() if lines else None, "actors": actors, "raw_lines": lines}
+    _LVR_CACHE[path] = out
+    return out
+
+
+def find_related(root, name, ext, preferred_dir=None):
+    stem = os.path.splitext(os.path.basename(name))[0].lower()
+    candidates = []
+    if preferred_dir:
+        candidates.extend([
+            os.path.join(preferred_dir, stem + ext),
+            os.path.join(preferred_dir, stem, stem + ext),
+        ])
+    if root and os.path.isdir(root):
+        for base, _dirs, files in os.walk(root):
+            for fn in files:
+                if os.path.splitext(fn)[0].lower() == stem and os.path.splitext(fn)[1].lower() == ext:
+                    candidates.append(os.path.join(base, fn))
+                    break
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def resolve_ats_asset(ats_path, ats, root):
+    values = ats.get("values", {})
+    model = values.get("modelFile", "")
+    collision = values.get("collisionFile", "")
+    aset = values.get("animSetFile", "")
+    model_path = values.get("modelPath", "")
+    base_dir = os.path.dirname(ats_path)
+    search_dirs = [base_dir]
+    if model_path:
+        rel = model_path.replace("\\", os.sep).replace("/", os.sep)
+        if root:
+            search_dirs.append(os.path.join(root, rel.lstrip(os.sep)))
+        search_dirs.append(os.path.join(base_dir, rel))
+    out = {
+        "bin": find_related(root, model, ".bin", preferred_dir=search_dirs[-1]),
+        "col": find_related(root, collision, ".col", preferred_dir=search_dirs[-1]),
+        "aset": find_related(root, aset, ".aset", preferred_dir=search_dirs[-1]),
+    }
+    return out
+
+
+def parse_mat(path):
+    raw = parse_kv_text(path, allow_equals=False)
+    return {k.lower(): v for k, v in raw.items()}
 
 
 # ============================================================================
 #  Materials
 # ============================================================================
 
-def make_material(name, tex_path, shader_type, use_vcol, normal_path=None):
+def make_material(name, tex_path, shader_type, use_vcol, normal_path=None, metadata=None):
     mat = bpy.data.materials.new(name)
     mat.use_nodes = True
     nt = mat.node_tree
@@ -792,6 +1004,12 @@ def make_material(name, tex_path, shader_type, use_vcol, normal_path=None):
         mat.blend_method = "BLEND"
 
     mat["swbh_shader_type"] = shader_type or ""
+    if metadata:
+        for _k, _v in metadata.items():
+            try:
+                mat["swbh_mat_" + str(_k)] = _v
+            except Exception:
+                pass
     return mat
 
 
@@ -802,6 +1020,7 @@ def make_submesh_material(s, obj_name, model_dir, index, opt, have_col, missing)
     info = {}
     tex_file = None
     normal_file = None
+    mat_file = None
     if opt["textures"] and stem:
         mat_file = locate(stem, model_dir, "materials", (".mat",), mat_index)
         info = parse_mat(mat_file) if mat_file else {}
@@ -812,9 +1031,14 @@ def make_submesh_material(s, obj_name, model_dir, index, opt, have_col, missing)
         normal_file = locate(dstem + "NormalMap", model_dir, "textures",
                              TEX_EXTS, tex_index)
 
-    return make_material("%s_%d_%s" % (obj_name, s["index"], stem or "none"),
-                         tex_file, info.get("shadertype", ""),
-                         have_col and opt["vcol"], normal_file)
+    mat_obj = make_material("%s_%d_%s" % (obj_name, s["index"], stem or "none"),
+                            tex_file, info.get("shadertype", ""),
+                            have_col and opt["vcol"], normal_file, metadata=info)
+    if mat_file:
+        mat_obj["swbh_source_mat"] = mat_file
+    if tex_file:
+        mat_obj["swbh_source_texture"] = tex_file
+    return mat_obj
 
 
 # ============================================================================
@@ -883,8 +1107,94 @@ def split_connected(subs):
     return [comps[r] for r in order]
 
 
+
+def build_rigid_mechanism_parts(d, name, subs, model_dir, index, opt, missing,
+                                nodes, tracks, actor_location=(0.0, 0.0, 0.0),
+                                actor_rotation=(1.0, 0.0, 0.0, 0.0),
+                                collection=None, fps=30.0, frame_offset=1):
+    """Build rigid mechanism submeshes as independent plain objects.
+
+    Rigid mechanisms (doors, gates, some switches/elevators) are not skinned
+    character meshes. A submesh's +0x10 id selects the node that drives it.
+    The geometry needs the node's frame-0 translation baked into its vertices,
+    while animation should apply only the *delta* from frame 0. Using an
+    Armature here applies the same hierarchy transform a second time and is
+    especially error-prone for doors. This path deliberately keeps the game
+    node transform as ordinary object transforms instead.
+    """
+    if not nodes or not tracks:
+        return [], 0
+
+    by_node = {}
+    for sub in subs:
+        if sub.get("collision"):
+            continue
+        by_node.setdefault(sub.get("rigid_node", 0), []).append(sub)
+
+    made = []
+    max_frames = 0
+    actor_q = Quaternion(actor_rotation)
+    sc = opt.get("scale", 1.0)
+    actor_loc = Vector(actor_location)
+
+    for node_idx, group in by_node.items():
+        if node_idx < 0 or node_idx >= len(nodes):
+            continue
+        driven_name = rigid_driving_node(nodes, tracks, node_idx)
+        track = tracks.get(driven_name) if driven_name else None
+
+        # Baked frame-0 translation in the vertices. Animation object
+        # translation is therefore a delta from frame 0, not the absolute
+        # game-space track value.
+        obj = build_mesh(d, "%s_%s" % (name, nodes[node_idx][0]), group,
+                         model_dir, index, opt, missing, nodes=None,
+                         rigid_offsets=rigid_rest_offsets(nodes, tracks))
+        if obj is None:
+            continue
+        obj.location = actor_loc
+        obj.rotation_mode = "QUATERNION"
+        obj.rotation_quaternion = actor_q
+
+        obj["swbh_rigid_node"] = nodes[node_idx][0]
+        if driven_name:
+            obj["swbh_rigid_driver"] = driven_name
+        if track:
+            # Save actual frame-0 transform for diagnostics and exact delta
+            # animation. No armature modifier is added.
+            p0 = sample_pos(track["pos"], 0.0) if track.get("pos") else Vector((0, 0, 0))
+            q0 = sample_rot(track["rot"], 0.0) if track.get("rot") else Quaternion((1, 0, 0, 0))
+            obj["swbh_rigid_rest_pos"] = tuple(float(v) for v in p0)
+            obj["swbh_rigid_rest_rot"] = tuple(float(v) for v in q0)
+
+            obj.animation_data_create()
+            n_frames = max(1, int(round((track.get("duration") or 0.0) * fps)))
+            # The track parser stores key lists but not a duration on every
+            # track in older files; use the parent ABIN duration when supplied
+            # by the caller via the special key below.
+            n_frames = max(1, int(round(tracks.get("__duration__", 0.0) * fps)))
+            for f in range(n_frames + 1):
+                t = f * tracks.get("__duration__", 0.0) / n_frames if n_frames else 0.0
+                frame = frame_offset + f
+                if track.get("pos"):
+                    pt = sample_pos(track["pos"], t)
+                    delta = (pt - p0) * sc
+                    obj.location = actor_loc + delta
+                    obj.keyframe_insert("location", frame=frame)
+                if track.get("rot"):
+                    qt = sample_rot(track["rot"], t)
+                    # Track rotation is in the actor's local mechanism space.
+                    obj.rotation_quaternion = actor_q @ qt
+                    obj.keyframe_insert("rotation_quaternion", frame=frame)
+            max_frames = max(max_frames, n_frames)
+
+        (collection or bpy.context.collection).objects.link(obj)
+        made.append(obj)
+
+    return made, max_frames
+
+
 def build_mesh(d, name, subs, model_dir, index, opt, missing, nodes=None,
-               rigid_offsets=None):
+               rigid_offsets=None, rigid_matrices=None):
     verts, faces, loop_mats = [], [], []
     normals, uvs_v, cols_v = [], [], []
     skin_v = []                                  # per vertex: [(bone_index, weight)]
@@ -895,27 +1205,50 @@ def build_mesh(d, name, subs, model_dir, index, opt, missing, nodes=None,
     have_nrm = all(s["p_nrm"] for s in subs)
     have_col = any(s["p_col"] for s in subs)
 
+    def _pool_key(sub):
+        # A shared vertex buffer can contain several DIFFERENT rigid pieces.
+        # Pooling only by vb_key used to make the first piece's rigid transform
+        # and synthetic vertex group leak into the next one.  Keep real-skinned
+        # buffers pooled normally; split synthetic rigid pieces by node id.
+        synthetic_rigid = (not sub.get("skin") and nodes and len(nodes) > 1
+                           and 0 <= sub.get("rigid_node", -1) < len(nodes))
+        if synthetic_rigid and (rigid_matrices or rigid_offsets):
+            return (sub["vb_key"], sub.get("rigid_node", 0))
+        return sub["vb_key"]
+
     for s in subs:
-        key = s["vb_key"]
+        key = _pool_key(s)
         if key not in pool:
             # Read only the vertices this specific build_mesh() call actually
             # needs for this buffer - not the whole original n_vert range.
-            # Matters once split_connected() has broken a big shared buffer
-            # into many small fragments; reading the full buffer per
-            # fragment would be O(fragment_count x buffer_size) instead of
-            # O(vertices actually used).
             needed = set()
             for s2 in subs:
-                if s2["vb_key"] == key:
+                if _pool_key(s2) == key:
                     needed.update(s2["indices"])
             needed = sorted(needed)
             remap = {li: i for i, li in enumerate(needed)}
 
             pos, nrm, uv, col = read_vb_indices(d, s, needed)
-            off = rigid_offsets.get(s["rigid_node"]) if rigid_offsets else None
-            if off:
-                ox, oy, oz = off
-                pos = [(p[0] + ox, p[1] + oy, p[2] + oz) for p in pos]
+
+            # Full rigid rest transform (translation + static orientation) is
+            # authoritative when available.  Only synthetic rigid_node meshes
+            # use it; smooth-skinned character buffers must stay in their
+            # original bind/model space.
+            rm = (rigid_matrices.get(s["rigid_node"])
+                  if rigid_matrices and not s.get("skin") else None)
+            if rm is not None:
+                pos = [tuple(rm @ Vector(p)) for p in pos]
+                if nrm:
+                    try:
+                        nm = rm.to_3x3().inverted().transposed()
+                        nrm = [tuple((nm @ Vector(v)).normalized()) for v in nrm]
+                    except Exception:
+                        pass
+            else:
+                off = rigid_offsets.get(s["rigid_node"]) if rigid_offsets else None
+                if off:
+                    ox, oy, oz = off
+                    pos = [(p[0] + ox, p[1] + oy, p[2] + oz) for p in pos]
             pool[key] = (len(verts), remap)
             sc = opt["scale"]
             verts.extend((p[0] * sc, p[1] * sc, p[2] * sc) for p in pos)
@@ -1141,7 +1474,27 @@ def parse_lvt(path):
     except StopIteration:
         pass
 
-    return {"sky": sky, "geom": geom, "lights": lights, "actors": actors}
+    world = {}
+    for l in lines:
+        m = re.match(r"\s*(FOGDIST|FARCLIP|FOGCOL|AMBLITE|FILLCOL|FLAGS|SUNCOLOR|SUNDIR|DEFAULTSMT|OBJECTACQUIRERADIUS|OBJECTRELEASERADIUS|ENVATS|CHEWIE_LEVEL_CLASS):\s*(.*)$", l)
+        if not m:
+            continue
+        key, value = m.groups()
+        nums = value.split()
+        if key in {"FOGDIST", "FOGCOL", "AMBLITE", "FILLCOL", "SUNCOLOR", "SUNDIR"}:
+            try:
+                world[key.lower()] = tuple(float(x) for x in nums if re.fullmatch(r"[-+0-9.eE]+", x))
+            except ValueError:
+                world[key.lower()] = value
+        elif key in {"FARCLIP", "OBJECTACQUIRERADIUS", "OBJECTRELEASERADIUS"}:
+            try: world[key.lower()] = float(nums[0])
+            except (ValueError, IndexError): world[key.lower()] = value
+        elif key == "FLAGS":
+            try: world[key.lower()] = int(nums[0])
+            except (ValueError, IndexError): world[key.lower()] = value
+        else:
+            world[key.lower()] = value.strip()
+    return {"sky": sky, "geom": geom, "lights": lights, "actors": actors, "world": world, "path": path}
 
 
 def get_collection(name):
@@ -1150,6 +1503,93 @@ def get_collection(name):
         col = bpy.data.collections.new(name)
         bpy.context.scene.collection.children.link(col)
     return col
+
+
+def add_collision_visuals(col_path, target_obj=None, collection_name="SWBH Collision", scale=1.0):
+    """Create simple hidden wire collision helpers from text .col data."""
+    data = parse_col(col_path)
+    if data.get("binary"):
+        print("[SWBH] binary collision variant not decoded: %s" % col_path)
+        return []
+    col = get_collection(collection_name)
+    created = []
+
+    def _empty(name, location=(0, 0, 0), display="SPHERE", radius=0.25):
+        obj = bpy.data.objects.new(name, None)
+        obj.empty_display_type = display
+        obj.empty_display_size = radius
+        obj.empty_display_size = max(0.05, radius)
+        obj.location = location
+        col.objects.link(obj)
+        obj.hide_render = True
+        obj.hide_set(True)
+        if target_obj is not None:
+            obj["swbh_collision_source"] = col_path
+            obj["swbh_collision_target"] = target_obj.name
+        created.append(obj)
+        return obj
+
+    for i, box in enumerate(data.get("boxes", [])):
+        mn = Vector(box["min"]); mx = Vector(box["max"])
+        center = (mn + mx) * 0.5
+        size = (mx - mn)
+        ob = bpy.data.objects.new("COL_BBOX_%02d" % i, None)
+        ob.empty_display_type = "CUBE"
+        ob.empty_display_size = max(size.length * 0.5 * scale, 0.05)
+        ob.location = tuple(float(v) * scale for v in center)
+        col.objects.link(ob)
+        ob.hide_render = True; ob.hide_set(True)
+        ob["swbh_collision_source"] = col_path
+        ob["swbh_collision_min"] = tuple(mn)
+        ob["swbh_collision_max"] = tuple(mx)
+        created.append(ob)
+
+    for i, item in enumerate(data.get("dcs", [])):
+        ob = _empty("COL_%s_%02d" % (item["bone"], i), item["offset"], "SPHERE", item["radius"])
+        ob["swbh_collision_bone"] = item["bone"]
+        ob["swbh_collision_radius"] = item["radius"]
+    return created
+
+
+def apply_asset_metadata(obj, ats_path, ats_info, related):
+    if obj is None:
+        return
+    values = ats_info.get("values", {})
+    obj["swbh_source_ats"] = ats_path
+    obj["swbh_asset_label"] = str(values.get("label", obj.name))
+    for key in ("chewieClass", "modelFile", "modelPath", "collisionFile", "animSetFile",
+                "soundTable", "inventory", "propFlags", "controlFlags"):
+        if key in values:
+            obj["swbh_ats_" + key] = values[key]
+    if related.get("col"):
+        obj["swbh_collision_file"] = related["col"]
+    if related.get("aset"):
+        obj["swbh_animation_set"] = related["aset"]
+    if related.get("bin"):
+        obj["swbh_model_file"] = related["bin"]
+
+
+def apply_lvt_world_settings(path, world_data, scale):
+    scene = bpy.context.scene
+    scene["swbh_source_lvt"] = path
+    for key, value in world_data.items():
+        try:
+            scene["swbh_world_" + key] = value
+        except Exception:
+            pass
+    w = bpy.data.worlds.get(os.path.splitext(os.path.basename(path))[0] + "_World")
+    if w is None:
+        w = bpy.data.worlds.new(os.path.splitext(os.path.basename(path))[0] + "_World")
+    scene.world = w
+    w.use_nodes = True
+    bg = w.node_tree.nodes.get("Background")
+    if bg:
+        amb = world_data.get("amblite")
+        if isinstance(amb, (tuple, list)) and len(amb) >= 3:
+            bg.inputs["Color"].default_value = (float(amb[0]), float(amb[1]), float(amb[2]), 1.0)
+        strength = float(max(0.0, sum(amb) / 3.0)) if isinstance(amb, (tuple, list)) and amb else 0.3
+        bg.inputs["Strength"].default_value = strength
+
 
 
 # ============================================================================
@@ -1424,6 +1864,246 @@ def rest_pose_from_tracks(tracks):
     return out
 
 
+
+def _mat4_from_file(d, off, transpose=False):
+    """Read one 4x4 float matrix from the BIN node-matrix table.
+
+    The engine dumps matrices in its native row-vector layout on the samples
+    measured so far (translation in the last ROW).  Blender uses column-vector
+    transforms (translation in the last COLUMN), therefore the useful form is
+    normally the transpose.  rigid_bin_node_matrices() still tests both forms
+    instead of hard-coding that assumption so an odd exporter variant does not
+    silently corrupt a mechanism.
+    """
+    vals = struct.unpack_from("<16f", d, off)
+    m = Matrix((vals[0:4], vals[4:8], vals[8:12], vals[12:16]))
+    return m.transposed() if transpose else m
+
+
+def _matrix_max_error(a, b):
+    return max(abs(float(a[r][c]) - float(b[r][c]))
+               for r in range(4) for c in range(4))
+
+
+def _matrix_affine_error(m):
+    # In Blender/column-vector form an affine matrix's bottom row is 0,0,0,1.
+    return (abs(float(m[3][0])) + abs(float(m[3][1]))
+            + abs(float(m[3][2])) + abs(float(m[3][3]) - 1.0))
+
+
+def _quat_angle_error(a, b):
+    try:
+        qa = a.normalized()
+        qb = b.normalized()
+        dot = min(1.0, max(-1.0, abs(float(qa.dot(qb)))))
+        # 1-dot is enough for candidate scoring; no acos/radians needed.
+        return 1.0 - dot
+    except Exception:
+        return 1.0
+
+
+def rigid_bin_node_matrices(d, nodes, tracks=None):
+    """Decode the per-node matrix table in a modern .bin.
+
+    hdr[0x14] points at a node-matrix array and hdr[0x1C] at the name/parent
+    array.  The horizontal-door files measured by the new door probe have
+    128-byte node records: two 4x4 matrices per node.  Other actors commonly
+    use 256-byte records; their first two matrices are still tested here, but
+    ONLY rigid_node mechanisms consume this result.
+
+    We deliberately do not guess which matrix is local/world, whether the dump
+    needs transposing, or whether an exporter stored the inverse pair.  Eight
+    interpretations are scored against BOTH the hierarchy and the ABIN frame-0
+    transform (when a matching track exists).  The lowest-error interpretation
+    wins.  This is the missing source of static node orientation that the old
+    importer ignored entirely - exactly the kind of omission that can turn one
+    door leaf by 90 degrees while the LVT placement itself is correct.
+
+    Returns (local_by_name, world_by_index, metadata), or ({}, {}, metadata)
+    when the table is unavailable/implausible.  Matrices are in GAME UNITS;
+    scale is applied later when building Blender data.
+    """
+    meta = {"available": False}
+    if not nodes or len(d) < 0x30:
+        return {}, {}, meta
+
+    try:
+        mat_base_raw = _u32(d, 0x14)
+        name_base_raw = _u32(d, 0x1C)
+        if name_base_raw <= mat_base_raw:
+            return {}, {}, meta
+        span = name_base_raw - mat_base_raw
+        if span % len(nodes):
+            return {}, {}, meta
+        stride = span // len(nodes)
+        meta["stride"] = stride
+        if stride < 128:
+            return {}, {}, meta
+
+        mat_base = mat_base_raw + BASE
+        if mat_base + (len(nodes) - 1) * stride + 128 > len(d):
+            return {}, {}, meta
+
+        raw_pairs = []
+        for i in range(len(nodes)):
+            off = mat_base + i * stride
+            raw_pairs.append((off, off + 64))
+
+        candidates = []
+        for transpose in (False, True):
+            pair = []
+            failed = False
+            for a_off, b_off in raw_pairs:
+                try:
+                    pair.append((_mat4_from_file(d, a_off, transpose),
+                                 _mat4_from_file(d, b_off, transpose)))
+                except (struct.error, ValueError):
+                    failed = True
+                    break
+            if failed:
+                continue
+
+            for swap in (False, True):
+                for invert in (False, True):
+                    local = []
+                    world = []
+                    ok = True
+                    for a, b in pair:
+                        l, w = ((b, a) if swap else (a, b))
+                        if invert:
+                            try:
+                                l = l.inverted()
+                                w = w.inverted()
+                            except Exception:
+                                ok = False
+                                break
+                        local.append(l.copy())
+                        world.append(w.copy())
+                    if not ok:
+                        continue
+
+                    affine = sum(_matrix_affine_error(m) for m in local + world)
+                    hierarchy = 0.0
+                    for i, (_bn, par) in enumerate(nodes):
+                        expected = local[i] if par < 0 else (world[par] @ local[i])
+                        hierarchy += _matrix_max_error(world[i], expected)
+
+                    track_error = 0.0
+                    track_hits = 0
+                    if tracks:
+                        for i, (bn, _par) in enumerate(nodes):
+                            tr = tracks.get(bn)
+                            if not tr:
+                                continue
+                            if tr.get("pos"):
+                                p0 = Vector(tr["pos"][0][1][:3])
+                                track_error += (local[i].to_translation() - p0).length
+                                track_hits += 1
+                            if tr.get("rot"):
+                                q0 = sample_rot(tr["rot"], 0.0)
+                                track_error += 4.0 * _quat_angle_error(
+                                    local[i].to_quaternion(), q0)
+                                track_hits += 1
+
+                    # Affine/layout mistakes should dominate; hierarchy is the
+                    # structural authority; ABIN frame 0 disambiguates direct
+                    # vs inverse/local-vs-world in otherwise symmetric cases.
+                    score = affine * 1000.0 + hierarchy * 100.0 + track_error
+                    candidates.append((score, affine, hierarchy, track_error,
+                                       track_hits, transpose, swap, invert,
+                                       local, world))
+
+        if not candidates:
+            return {}, {}, meta
+        candidates.sort(key=lambda x: x[0])
+        (score, affine, hierarchy, track_error, track_hits,
+         transpose, swap, invert, local, world) = candidates[0]
+
+        meta.update({
+            "available": True,
+            "score": float(score),
+            "affine_error": float(affine),
+            "hierarchy_error": float(hierarchy),
+            "track_error": float(track_error),
+            "track_hits": int(track_hits),
+            "transpose": bool(transpose),
+            "pair_swapped": bool(swap),
+            "inverted": bool(invert),
+        })
+
+        # A wildly non-affine result is worse than the old ABIN-only fallback.
+        # Keep this threshold deliberately generous: normal float noise is many
+        # orders of magnitude below it.
+        if affine > 0.1 or hierarchy > max(0.1, len(nodes) * 0.05):
+            meta["rejected"] = True
+            return {}, {}, meta
+
+        return ({nodes[i][0]: local[i] for i in range(len(nodes))},
+                {i: world[i] for i in range(len(nodes))}, meta)
+    except (struct.error, ValueError, ZeroDivisionError) as exc:
+        meta["error"] = str(exc)
+        return {}, {}, meta
+
+
+def _matrix_with_channels(base, track):
+    """Merge an animation track's frame-0 channels into a BIN local matrix.
+
+    The BIN matrix supplies static channels that an animation does NOT record.
+    Example: a sliding door can animate translation only while its node keeps a
+    permanent 90-degree rest rotation.  The old importer replaced the entire
+    local transform from the ABIN track and therefore silently lost that static
+    rotation.
+    """
+    try:
+        loc, rot, scl = base.decompose()
+    except Exception:
+        loc = Vector((0.0, 0.0, 0.0))
+        rot = Quaternion((1.0, 0.0, 0.0, 0.0))
+        scl = Vector((1.0, 1.0, 1.0))
+
+    if track:
+        if track.get("pos"):
+            loc = sample_pos(track["pos"], 0.0)
+        if track.get("rot"):
+            rot = sample_rot(track["rot"], 0.0)
+
+    sm = Matrix.Diagonal((float(scl[0]), float(scl[1]), float(scl[2]), 1.0))
+    return Matrix.Translation(loc) @ rot.to_matrix().to_4x4() @ sm
+
+
+def rigid_rest_state(d, nodes, tracks):
+    """Build the complete rest state for a rigid_node mechanism.
+
+    BIN local matrices are the static authority; ABIN frame 0 overrides only
+    the channels it actually contains.  If the matrix table cannot be decoded,
+    this cleanly falls back to identity + ABIN frame 0, i.e. the useful part of
+    the old rigid_rest_offsets() behaviour without discarding rotations.
+
+    Returns (local_by_name, world_by_index, metadata).
+    """
+    tracks = tracks or {}
+    bin_local, _bin_world, meta = rigid_bin_node_matrices(d, nodes, tracks)
+
+    local = {}
+    for bn, _par in nodes:
+        base = bin_local.get(bn, Matrix.Identity(4))
+        local[bn] = _matrix_with_channels(base, tracks.get(bn))
+
+    world = {}
+    for i, (bn, par) in enumerate(nodes):
+        L = local[bn]
+        world[i] = (world[par] @ L) if par >= 0 and par in world else L.copy()
+
+    meta = dict(meta)
+    meta["source"] = "BIN+ABIN" if bin_local else "ABIN_fallback"
+    return local, world, meta
+
+
+def _scaled_rigid_matrix(m, scale):
+    """Scale only translation; keep a clean orthonormal bone basis."""
+    loc, rot, _scl = m.decompose()
+    return Matrix.Translation(loc * scale) @ rot.to_matrix().to_4x4()
+
 def find_base_abin(model_dir, obj_stem):
     folder = os.path.join(model_dir, "animations")
     if not os.path.isdir(folder):
@@ -1652,28 +2332,23 @@ def resolve_mechanism_tracks(nodes, tracks):
     return tracks
 
 
-def build_rigid_armature(name, nodes, pose, scale):
-    """Like build_armature(), but WITHOUT AXIS_FIX. EXPERIMENTAL - built and
-    logic-tested against a stubbed Blender API only, not yet confirmed in a
-    real Blender session, unlike almost everything else in this file.
+def build_rigid_armature(name, nodes, rest_local, scale):
+    """Build an armature for a rigid_node mechanism from COMPLETE local rest
+    matrices (BIN static transform + ABIN frame-0 channels).
 
-    AXIS_FIX exists to reconcile this engine's "-X forward" bone convention
-    with Blender's "+Y forward" one - that only matters when a bone's OWN
-    rotation is being interpreted through its local axis frame. Every rigid
-    mechanism measured so far (o_c_smalldoora, o_b_horizontaldoorc/d) has
-    PURE TRANSLATION animation, no rotation key at all, so there is no bone-
-    forward convention to reconcile in the first place. Worse: AXIS_FIX is a
-    real rotation matrix, and `world[i] @ AXIS_FIX` was measured to rotate
-    the bone's OWN accumulated hierarchical translation along with its
-    orientation - not just a display convention, an actual position error -
-    which is the direct, confirmed cause of O_B_HorizontalDoorD visibly
-    twisting the one time an armature was tried for a rigid mechanism
-    before. This function is the same as build_armature() with that one
-    `@ AXIS_FIX` removed, nothing else changed.
+    No character AXIS_FIX is used.  Unlike the old implementation, bone rest
+    orientation is not reconstructed from animation tracks alone: unanimated
+    channels come from the BIN node-matrix table, so a translation-only door
+    keeps its authored static rotation.  Bone matrices are kept orthonormal;
+    only their translations are scaled to Blender units.
     """
     arm_data = bpy.data.armatures.new(name + "_arm")
     arm = bpy.data.objects.new(name + "_skeleton", arm_data)
     bpy.context.collection.objects.link(arm)
+    try:
+        arm.show_in_front = True
+    except Exception:
+        pass
 
     prev = bpy.context.view_layer.objects.active
     bpy.context.view_layer.objects.active = arm
@@ -1681,31 +2356,32 @@ def build_rigid_armature(name, nodes, pose, scale):
 
     world = []
     for i, (bn, par) in enumerate(nodes):
-        L = local_matrix(pose, bn)
-        world.append((world[par] @ L) if par >= 0 else L)
+        L = rest_local.get(bn, Matrix.Identity(4))
+        world.append((world[par] @ L) if par >= 0 else L.copy())
 
-    S = Matrix.Scale(scale, 4)
     ebones = []
     for i, (bn, par) in enumerate(nodes):
         eb = arm_data.edit_bones.new(bn)
         eb.head = (0.0, 0.0, 0.0)
-        eb.tail = (0.0, 1.0, 0.0)              # placeholder; matrix sets the rest
-        eb.matrix = S @ world[i]                # no AXIS_FIX - see docstring
+        eb.tail = (0.0, 1.0, 0.0)
+        eb.matrix = _scaled_rigid_matrix(world[i], scale)
         ebones.append(eb)
 
     kids = {}
-    for i, (bn, par) in enumerate(nodes):
+    for i, (_bn, par) in enumerate(nodes):
         if par >= 0:
             kids.setdefault(par, []).append(i)
     for i, eb in enumerate(ebones):
         ch = kids.get(i, [])
         if ch:
-            d = (ebones[ch[0]].head - eb.head).length
-            eb.length = max(d, 1e-4)
+            distances = [(ebones[c].head - eb.head).length for c in ch]
+            distances = [d for d in distances if d > 1e-6]
+            eb.length = max(min(distances) if distances else 0.05 * scale, 1e-4)
         else:
-            eb.length = max(ebones[nodes[i][1]].length * 0.5, 1e-3) \
-                if nodes[i][1] >= 0 else 0.1
-    for i, (bn, par) in enumerate(nodes):
+            par = nodes[i][1]
+            eb.length = max(ebones[par].length * 0.5, 1e-3) if par >= 0 else 0.1
+
+    for i, (_bn, par) in enumerate(nodes):
         if par >= 0:
             ebones[i].parent = ebones[par]
 
@@ -1713,32 +2389,44 @@ def build_rigid_armature(name, nodes, pose, scale):
     bpy.context.view_layer.objects.active = prev
 
     arm["swbh_rest"] = name
+    arm["swbh_rigid_armature"] = True
     return arm
 
+def apply_rigid_animation_onto(arm, nodes, rest_local, tracks, fps, scale,
+                               action, frame_offset=1):
+    """Animate a rigid mechanism while preserving BIN-authored rest channels.
 
-def apply_rigid_animation_onto(arm, nodes, rest_pose, tracks, fps, action,
-                               frame_offset=1):
-    """Like apply_animation_onto(), but WITHOUT AXIS_FIX/its inverse -
-    matches build_rigid_armature()'s plain rest bones. EXPERIMENTAL, same
-    caveat as that function.
+    ABIN clips are sparse by channel: a sliding door may contain translation
+    only; a hinge may contain rotation only.  Missing channels MUST retain the
+    BIN/rest value.  The previous rigid path substituted zero translation or
+    identity rotation, which could erase a static 90-degree node orientation.
 
-    Handles BOTH families of rigid mechanism measured so far: sliding
-    (o_c_smalldoora, o_b_horizontaldoorc/d - pure translation, no rotation
-    key at all) and hinge/swing or continuous-spin (o_f_doorbig/doorsmall/
-    gatebig, o_a_fan - pure rotation, no position key at all). A track's
-    own local matrix is sampled the same way local_matrix() builds the rest
-    one, just at time t instead of frame 0, so either shape - or in
-    principle both together - works without special-casing. Returns
-    n_frames."""
+    At frame 0, the merged rest matrix and sampled animation matrix are
+    identical, therefore every pose bone's matrix_basis is identity.  Later
+    frames are exact deltas from that rest state.  Translation deltas are
+    scaled to Blender units; rotations are untouched.
+    """
     if arm.animation_data is None:
         arm.animation_data_create()
     arm.animation_data.action = action
 
-    rest_local = {bn: local_matrix(rest_pose, bn) for bn, _ in nodes}
-    rest_inv = {bn: rest_local[bn].inverted() for bn, _ in nodes}
+    rest_scaled = {bn: _scaled_rigid_matrix(
+        rest_local.get(bn, Matrix.Identity(4)), scale) for bn, _ in nodes}
+    rest_inv = {bn: rest_scaled[bn].inverted() for bn, _ in nodes}
+
+    rest_components = {}
+    for bn, _ in nodes:
+        try:
+            loc, rot, _scl = rest_local.get(bn, Matrix.Identity(4)).decompose()
+        except Exception:
+            loc = Vector((0.0, 0.0, 0.0))
+            rot = Quaternion((1.0, 0.0, 0.0, 0.0))
+        rest_components[bn] = (loc, rot)
 
     duration = 0.0
     for tr in tracks.values():
+        if not isinstance(tr, dict):
+            continue
         if tr.get("pos"):
             duration = max(duration, tr["pos"][-1][0])
         if tr.get("rot"):
@@ -1746,7 +2434,9 @@ def apply_rigid_animation_onto(arm, nodes, rest_pose, tracks, fps, action,
 
     n_frames = max(1, int(round(duration * fps)))
     animated = [bn for bn, _ in nodes
-               if bn in tracks and (tracks[bn].get("pos") or tracks[bn].get("rot"))]
+                if bn in tracks and isinstance(tracks[bn], dict)
+                and (tracks[bn].get("pos") or tracks[bn].get("rot"))]
+
     for f in range(n_frames + 1):
         t = f * duration / n_frames if n_frames else 0.0
         frame = frame_offset + f
@@ -1755,17 +2445,19 @@ def apply_rigid_animation_onto(arm, nodes, rest_pose, tracks, fps, action,
             if pb is None:
                 continue
             tr = tracks[bn]
-            loc = sample_pos(tr["pos"], t) if tr.get("pos") else Vector((0.0, 0.0, 0.0))
-            rot = sample_rot(tr["rot"], t) if tr.get("rot") else Quaternion((1.0, 0.0, 0.0, 0.0))
-            L_anim = Matrix.Translation(loc) @ rot.to_matrix().to_4x4()
-            pb.matrix_basis = rest_inv[bn] @ L_anim
+            rest_loc, rest_rot = rest_components[bn]
+            loc = sample_pos(tr["pos"], t) if tr.get("pos") else rest_loc
+            rot = sample_rot(tr["rot"], t) if tr.get("rot") else rest_rot
+            anim_local = Matrix.Translation(loc) @ rot.to_matrix().to_4x4()
+            anim_scaled = _scaled_rigid_matrix(anim_local, scale)
+            pb.matrix_basis = rest_inv[bn] @ anim_scaled
             pb.rotation_mode = "QUATERNION"
             if tr.get("pos"):
                 pb.keyframe_insert("location", frame=frame, group=bn)
             if tr.get("rot"):
                 pb.keyframe_insert("rotation_quaternion", frame=frame, group=bn)
-    return n_frames
 
+    return n_frames
 
 def apply_animation_onto(arm, nodes, rest_pose, path, fps, scale, action,
                          frame_offset, zero_root_translation=False,
@@ -2029,22 +2721,14 @@ class IMPORT_OT_swbh_bin(bpy.types.Operator, ImportHelper):
                     "skeletons again")
     animate_mechanisms: BoolProperty(
         name="Animate rigid mechanisms (doors etc.)", default=True,
-        description="Rigid multi-part mechanisms (doors, etc.) aren't "
-                    "skinned at all - each submesh is tied to one node via "
-                    "an 'id' field instead. Measured on every one seen so "
-                    "far (o_c_smalldoora, o_b_horizontaldoorc/d): their "
-                    "animation is pure translation, no rotation key at all - "
-                    "so each moving part is built as its own plain object "
-                    "under a shared empty and keyframed directly (Location "
-                    "only), with no armature involved at all. A skeletal "
-                    "(armature-based) version was tried twice and reverted "
-                    "twice - first a position bug, then a 90-degree twist, "
-                    "both from edit-bone matrix/roll behaviour that kept "
-                    "not matching what the math predicted. The plain-object "
-                    "path has none of that ambiguity and is the one actually "
-                    "used here. Falls back to the old static, corrected-but-"
-                    "frozen single mesh if any part is missing a usable "
-                    "track")
+        description="Rigid multi-part mechanisms (doors, gates, fans, switches, "
+                    "etc.) are imported with a dedicated mechanism armature. "
+                    "Static node transforms come from the BIN node-matrix "
+                    "table, while ABIN frame 0 overrides only the channels it "
+                    "actually records. This preserves authored rest rotations "
+                    "and pivots and keeps the mechanism convenient to edit "
+                    "and animate in Blender. Translation- and rotation-driven "
+                    "mechanisms are both supported.")
     flip_v: BoolProperty(
         name="Flip V", default=True,
         description="The game puts the UV origin at the top, Blender at the bottom")
@@ -2193,7 +2877,7 @@ class IMPORT_OT_swbh_bin(bpy.types.Operator, ImportHelper):
         failed = 0
 
         area_collection = None
-        lvt = {"sky": None, "geom": {}, "lights": [], "actors": []}
+        lvt = {"sky": None, "geom": {}, "lights": [], "actors": [], "world": {}}
         if self.whole_area:
             area_dir = self.directory or os.path.dirname(paths[0])
             area_name = os.path.basename(area_dir.rstrip("\\/")) or "SWBH Area"
@@ -2205,6 +2889,7 @@ class IMPORT_OT_swbh_bin(bpy.types.Operator, ImportHelper):
                     break
             if lvt_path:
                 lvt = parse_lvt(lvt_path)
+                apply_lvt_world_settings(lvt_path, lvt.get("world", {}), self.scale)
             sky_prefix = (lvt["sky"] or (area_name + "_skydome")).lower()
 
             found = []
@@ -2236,6 +2921,13 @@ class IMPORT_OT_swbh_bin(bpy.types.Operator, ImportHelper):
                 return {"CANCELLED"}
             paths = [os.path.join(area_dir, fn) for fn in found]
             area_collection = get_collection(area_name)
+            if lvt_path:
+                area_collection["swbh_source_lvt"] = lvt_path
+                for _k, _v in lvt.get("world", {}).items():
+                    try:
+                        area_collection["swbh_world_" + _k] = _v
+                    except Exception:
+                        pass
             print("[SWBH] whole area '%s': %d part files found%s"
                   % (area_name, len(paths),
                      " (%s.lvt found, sky='%s', %d lights, %d actors, %d/%d "
@@ -2302,34 +2994,47 @@ class IMPORT_OT_swbh_bin(bpy.types.Operator, ImportHelper):
                     continue
 
                 a_arm = None
-                a_rigid_offsets = {}
-                a_tracks = None
+                a_tracks = {}
                 a_dur = 0.0
-                if len(a_nodes) > 1 and any(s["rigid_node"] > 0 for s in a_visible):
+                a_rp = None
+                a_rest_local = {}
+                a_rigid_matrices = {}
+                a_rigid_meta = {}
+                a_is_rigid = False
+                a_has_rigid_nodes = (len(a_nodes) > 1 and any(
+                    s["rigid_node"] > 0 and not s.get("skin") for s in a_visible))
+                if a_has_rigid_nodes:
                     a_stem = os.path.splitext(os.path.basename(bp))[0]
+                    a_anim_dir = os.path.join(os.path.dirname(bp), "animations")
                     a_rp = (find_base_abin(os.path.dirname(bp), a_stem)
                            or find_any_abin(os.path.dirname(bp), a_stem))
-                    if a_rp:
+                    # A non-zero rigid_node is also used by some exported scene
+                    # graphs.  Only opt into mechanism rest matrices when this
+                    # asset actually has an animation context; otherwise leave
+                    # ordinary static props exactly as previous versions did.
+                    a_is_rigid = bool(a_rp or os.path.isdir(a_anim_dir))
+                    if a_is_rigid and a_rp:
                         try:
                             a_dur, a_tracks = parse_abin(a_rp)
                             a_tracks = resolve_mechanism_tracks(a_nodes, a_tracks)
-                            a_rigid_offsets = rigid_rest_offsets(a_nodes, a_tracks)
                         except (BinParseError, struct.error) as exc:
-                            print("[SWBH]   %s: rigid_offsets failed to parse %s: %s"
+                            print("[SWBH]   %s: mechanism ABIN parse failed %s: %s"
                                   % (a["cls"], os.path.basename(a_rp), exc))
-                            a_tracks = None
-                        if not a_rigid_offsets and a_tracks and not any(
-                                tr.get("rot") for tr in a_tracks.values()):
-                            print("[SWBH]   %s: found %s but it gave no rigid "
-                                  "offsets (no matching pos track by node name?)"
-                                  % (a["cls"], os.path.basename(a_rp)))
-                    else:
-                        adir = os.path.dirname(bp)
-                        if os.path.isdir(os.path.join(adir, "animations")):
-                            print("[SWBH]   %s: rigid_node mechanism but no "
-                                  "matching .abin found in %s/animations - "
-                                  "imported at raw, uncorrected vertex positions"
-                                  % (a["cls"], adir))
+                            a_tracks = {}
+                    if a_is_rigid:
+                        a_rest_local, a_rigid_matrices, a_rigid_meta = rigid_rest_state(
+                            ad, a_nodes, a_tracks)
+                    if a_is_rigid and a_rigid_meta.get("available"):
+                        print("[SWBH]   %s: rigid rest from BIN matrices "
+                              "(stride=%s, mode=%s%s%s, hierarchy_err=%.6g)"
+                              % (a["cls"], a_rigid_meta.get("stride"),
+                                 "transpose" if a_rigid_meta.get("transpose") else "raw",
+                                 "+swap" if a_rigid_meta.get("pair_swapped") else "",
+                                 "+inverse" if a_rigid_meta.get("inverted") else "",
+                                 a_rigid_meta.get("hierarchy_error", 0.0)))
+                    elif a_is_rigid and a_rp:
+                        print("[SWBH]   %s: BIN rigid matrix table unavailable; "
+                              "using ABIN frame-0 fallback" % a["cls"])
 
                 if self.actor_skeleton and has_riggable_data(a_nodes, a_visible):
                     a_stem = os.path.splitext(os.path.basename(bp))[0]
@@ -2354,21 +3059,22 @@ class IMPORT_OT_swbh_bin(bpy.types.Operator, ImportHelper):
                     else:
                         missing_base.add(a["cls"])
 
-                # Animate the mechanism with a real (AXIS_FIX-free) armature -
-                # see build_rigid_armature()/apply_rigid_animation_onto().
-                # Handles both families measured so far: sliding (pure
-                # translation) and hinge/spin (pure rotation) mechanisms.
+                # Rigid mechanisms keep a real armature for convenient editing,
+                # but their rest state comes from BIN node matrices merged with
+                # ABIN frame 0.  This preserves static leaf orientation/pivots.
                 animated = False
-                if self.animate_mechanisms and a_tracks and len(a_nodes) > 1:
+                if self.animate_mechanisms and a_tracks and a_is_rigid:
                     any_animated_node = any(
                         nm in a_tracks and (a_tracks[nm].get("pos") or a_tracks[nm].get("rot"))
                         for nm, _ in a_nodes)
                     if any_animated_node:
                         try:
-                            a_rest = rest_pose_from_tracks(a_tracks)
                             mech_arm = build_rigid_armature(a["name"], a_nodes,
-                                                            a_rest, sc)
-                            mech_arm["swbh_base_abin"] = a_rp
+                                                            a_rest_local, sc)
+                            if a_rp:
+                                mech_arm["swbh_base_abin"] = a_rp
+                            mech_arm["swbh_rigid_rest_source"] = a_rigid_meta.get(
+                                "source", "unknown")
                             x, y, z = a["pos"]
                             mech_arm.location = (x * sc, y * sc, z * sc)
                             w, qx, qy, qz = a["rot"]
@@ -2381,13 +3087,14 @@ class IMPORT_OT_swbh_bin(bpy.types.Operator, ImportHelper):
 
                             act = bpy.data.actions.new(a["name"] + "_anim")
                             act.use_fake_user = True
-                            apply_rigid_animation_onto(mech_arm, a_nodes, a_rest,
-                                                       a_tracks, 30.0, act)
+                            apply_rigid_animation_onto(
+                                mech_arm, a_nodes, a_rest_local, a_tracks,
+                                30.0, sc, act)
 
-                            mech_obj = build_mesh(ad, a["name"], a_visible,
-                                                  os.path.dirname(bp), index,
-                                                  opt, missing, a_nodes,
-                                                  a_rigid_offsets)
+                            mech_obj = build_mesh(
+                                ad, a["name"], a_visible, os.path.dirname(bp),
+                                index, opt, missing, a_nodes, None,
+                                a_rigid_matrices)
                             if mech_obj and mech_obj.vertex_groups:
                                 mech_obj.parent = mech_arm
                                 mod = mech_obj.modifiers.new("Armature", "ARMATURE")
@@ -2398,16 +3105,17 @@ class IMPORT_OT_swbh_bin(bpy.types.Operator, ImportHelper):
                                 imported.append(mech_obj)
                                 animated = True
                                 n_placed += 1
-                        except (BinParseError, struct.error) as exc:
-                            print("[SWBH]   %s: skeletal mechanism animation "
-                                  "failed (%s) - falling back to the static, "
-                                  "corrected mesh" % (a["cls"], exc))
+                        except (BinParseError, struct.error, ValueError) as exc:
+                            print("[SWBH]   %s: mechanism armature animation failed "
+                                  "(%s) - falling back to static corrected mesh"
+                                  % (a["cls"], exc))
 
                 if animated:
                     continue
 
                 aobj = build_mesh(ad, a["name"], a_visible, os.path.dirname(bp),
-                                  index, opt, missing, a_nodes, a_rigid_offsets)
+                                  index, opt, missing, a_nodes, None,
+                                  a_rigid_matrices)
                 if aobj:
                     if a_arm is not None and aobj.vertex_groups:
                         # The armature already carries the actor's placement,
@@ -2423,6 +3131,12 @@ class IMPORT_OT_swbh_bin(bpy.types.Operator, ImportHelper):
                         aobj.rotation_quaternion = Quaternion((w, qx, qy, qz))
                     aobj["swbh_actor_id"] = a["id"]
                     aobj["swbh_actor_class"] = a["cls"]
+                    actor_ats = find_related(root, a["cls"], ".ats", preferred_dir=os.path.dirname(bp)) if root else None
+                    if actor_ats:
+                        aobj["swbh_source_ats"] = actor_ats
+                        ainfo = parse_ats(actor_ats)
+                        a_related = resolve_ats_asset(actor_ats, ainfo, root)
+                        apply_asset_metadata(aobj, actor_ats, ainfo, a_related)
                     area_collection.objects.link(aobj)
                     imported.append(aobj)
                     n_placed += 1
@@ -2459,36 +3173,47 @@ class IMPORT_OT_swbh_bin(bpy.types.Operator, ImportHelper):
                 lod_groups = {lods_present[0]: subs}
             multi_lod = len(lods_present) > 1
 
-            # Rigid multi-part mechanisms (doors etc.) need their rest-pose
-            # offset even when no armature is being built at all - see
-            # rigid_rest_offsets(). Independent of the "skeleton" checkbox.
-            rigid_offsets = {}
-            if len(nodes) > 1 and any(s["rigid_node"] > 0 for s in subs):
-                rp = find_base_abin(mdir, stem) or find_any_abin(mdir, stem)
-                if rp:
+            # Decode the complete rigid mechanism rest state once.  The BIN
+            # matrix table carries static local orientation/pivots; ABIN frame 0
+            # overrides only animated channels.  This is independent of the
+            # character-skeleton checkbox.
+            rigid_tracks = {}
+            rigid_rp = None
+            rigid_rest_local = {}
+            rigid_matrices = {}
+            rigid_meta = {}
+            has_rigid_nodes = (len(nodes) > 1 and any(
+                s["rigid_node"] > 0 and not s.get("skin") for s in subs))
+            is_rigid_mechanism = False
+            if has_rigid_nodes:
+                rigid_rp = find_base_abin(mdir, stem) or find_any_abin(mdir, stem)
+                anim_dir_for_mech = os.path.join(mdir, "animations")
+                # Whole-area room BINs can carry node ids too but have no
+                # mechanism animation folder.  Do not reinterpret static level
+                # scene graphs as articulated mechanisms.
+                is_rigid_mechanism = bool(rigid_rp or os.path.isdir(anim_dir_for_mech))
+                if is_rigid_mechanism and rigid_rp:
                     try:
-                        _dur, tracks = parse_abin(rp)
-                        tracks = resolve_mechanism_tracks(nodes, tracks)
-                        rigid_offsets = rigid_rest_offsets(nodes, tracks)
+                        _dur, rigid_tracks = parse_abin(rigid_rp)
+                        rigid_tracks = resolve_mechanism_tracks(nodes, rigid_tracks)
                     except (BinParseError, struct.error) as exc:
-                        print("[SWBH]   rigid_offsets failed to parse %s: %s"
-                              % (os.path.basename(rp), exc))
-                        tracks = {}
-                    if not rigid_offsets and not any(
-                            tr.get("rot") for tr in tracks.values()):
-                        print("[SWBH]   found %s but it gave no rigid offsets "
-                              "(no matching pos track by node name?)"
-                              % os.path.basename(rp))
-                elif os.path.isdir(os.path.join(mdir, "animations")):
-                    # Only worth a warning if an animations/ folder exists at
-                    # all - room geometry (pa_*.bin etc) never has one (it is
-                    # not a real mechanism, just a merged Maya scene graph
-                    # with multiple named nodes) and warning there anyway was
-                    # confirmed pure noise: one line per room file, every
-                    # single time, in a real console log.
-                    print("[SWBH]   rigid_node mechanism but no matching .abin "
-                          "found in %s/animations - imported at raw, "
-                          "uncorrected vertex positions" % mdir)
+                        print("[SWBH]   mechanism ABIN parse failed %s: %s"
+                              % (os.path.basename(rigid_rp), exc))
+                        rigid_tracks = {}
+                if is_rigid_mechanism:
+                    rigid_rest_local, rigid_matrices, rigid_meta = rigid_rest_state(
+                        d, nodes, rigid_tracks)
+                if is_rigid_mechanism and rigid_meta.get("available"):
+                    print("[SWBH]   rigid rest: BIN node matrices stride=%s, "
+                          "mode=%s%s%s, hierarchy_err=%.6g"
+                          % (rigid_meta.get("stride"),
+                             "transpose" if rigid_meta.get("transpose") else "raw",
+                             "+swap" if rigid_meta.get("pair_swapped") else "",
+                             "+inverse" if rigid_meta.get("inverted") else "",
+                             rigid_meta.get("hierarchy_error", 0.0)))
+                elif is_rigid_mechanism and rigid_rp:
+                    print("[SWBH]   rigid rest: BIN matrix table unavailable; "
+                          "using ABIN frame-0 fallback")
 
             # Build the armature first: the mesh gets parented to it.
             arm = None
@@ -2543,54 +3268,48 @@ class IMPORT_OT_swbh_bin(bpy.types.Operator, ImportHelper):
                                 "no *_base.abin or any other .abin beside %s "
                                 "- skeleton skipped" % stem)
 
-            # Rigid mechanisms (doors etc.) opened directly, not through a
-            # whole-area actor placement: same animate_mechanisms feature,
-            # so this doesn't require importing the whole level just to see
-            # a door open. Only tried if the character path above didn't
-            # already build something into `arm`. Uses the same AXIS_FIX-
-            # free armature as the actor-placement path - see
-            # build_rigid_armature()/apply_rigid_animation_onto().
+            # Rigid mechanism armature.  Unlike the old 1.0/1.1.1 path,
+            # this does not reconstruct rest transforms from sparse ABIN tracks
+            # alone; it uses BIN static matrices too, so missing rotation/position
+            # channels cannot zero out an authored rest transform.
             mech_animated = False
-            if (arm is None and self.animate_mechanisms and len(nodes) > 1
-                    and any(s["rigid_node"] > 0 for s in subs)):
-                rp = find_base_abin(mdir, stem) or find_any_abin(mdir, stem)
-                if rp:
+            if (arm is None and self.animate_mechanisms and is_rigid_mechanism
+                    and rigid_tracks):
+                any_animated_node = any(
+                    nm in rigid_tracks and (rigid_tracks[nm].get("pos")
+                                            or rigid_tracks[nm].get("rot"))
+                    for nm, _ in nodes)
+                if any_animated_node:
                     try:
-                        m_dur, m_tracks = parse_abin(rp)
-                        m_tracks = resolve_mechanism_tracks(nodes, m_tracks)
-                        any_animated_node = any(
-                            nm in m_tracks and (m_tracks[nm].get("pos") or m_tracks[nm].get("rot"))
-                            for nm, _ in nodes)
-                        if any_animated_node:
-                            m_rest = rest_pose_from_tracks(m_tracks)
-                            arm = build_rigid_armature(name, nodes, m_rest, self.scale)
-                            arm["swbh_base_abin"] = rp
-                            imported.append(arm)
-                            act = bpy.data.actions.new(name + "_anim")
-                            act.use_fake_user = True
-                            n_frames = apply_rigid_animation_onto(
-                                arm, nodes, m_rest, m_tracks, self.anim_fps, act)
+                        arm = build_rigid_armature(
+                            name, nodes, rigid_rest_local, self.scale)
+                        if rigid_rp:
+                            arm["swbh_base_abin"] = rigid_rp
+                        arm["swbh_rigid_rest_source"] = rigid_meta.get(
+                            "source", "unknown")
+                        imported.append(arm)
+                        act = bpy.data.actions.new(name + "_anim")
+                        act.use_fake_user = True
+                        n_frames = apply_rigid_animation_onto(
+                            arm, nodes, rigid_rest_local, rigid_tracks,
+                            self.anim_fps, self.scale, act)
 
-                            mech_visible = [s for s in subs if not s["collision"]]
-                            mech_obj = build_mesh(d, name, mech_visible, mdir,
-                                                  index, opt, missing, nodes,
-                                                  rigid_offsets)
-                            if mech_obj and mech_obj.vertex_groups:
-                                mech_obj.parent = arm
-                                mod = mech_obj.modifiers.new("Armature", "ARMATURE")
-                                mod.object = arm
-                                (area_collection or context.collection).objects.link(mech_obj)
-                                imported.append(mech_obj)
-                                context.scene.frame_start = 1
-                                context.scene.frame_end = max(
-                                    context.scene.frame_end, n_frames + 1)
-                                mech_animated = True
-                                print("[SWBH]   mechanism armature: %d bones, "
-                                      "animation from %s, %d frames"
-                                      % (len(nodes), os.path.basename(rp), n_frames))
-                    except (BinParseError, struct.error) as exc:
+                        mech_visible = [s for s in subs if not s["collision"]]
+                        mech_obj = build_mesh(
+                            d, name, mech_visible, mdir, index, opt, missing,
+                            nodes, None, rigid_matrices)
+                        if mech_obj and mech_obj.vertex_groups:
+                            mech_obj.parent = arm
+                            mod = mech_obj.modifiers.new("Armature", "ARMATURE")
+                            mod.object = arm
+                            (area_collection or context.collection).objects.link(mech_obj)
+                            imported.append(mech_obj)
+                            context.scene.frame_start = 1
+                            context.scene.frame_end = max(
+                                context.scene.frame_end, n_frames + 1)
+                            mech_animated = True
+                    except (BinParseError, struct.error, ValueError) as exc:
                         self.report({"WARNING"}, "mechanism animation: %s" % exc)
-                        arm = None
 
             for lod_level, lod_subs in sorted(lod_groups.items()):
                 if mech_animated:
@@ -2614,9 +3333,10 @@ class IMPORT_OT_swbh_bin(bpy.types.Operator, ImportHelper):
                         else:
                             part_name = lod_name
                         obj = build_mesh(d, part_name, part, mdir, index, opt,
-                                         missing, nodes, rigid_offsets)
+                                         missing, nodes, None, rigid_matrices)
                         if obj:
                             obj["swbh_source"] = internal
+                            obj["swbh_source_bin"] = p
                             obj["swbh_lod"] = lod_level
                             obj["swbh_is_skydome"] = bool(
                                 self.whole_area and os.path.basename(p).lower().startswith(sky_prefix))
@@ -2628,8 +3348,13 @@ class IMPORT_OT_swbh_bin(bpy.types.Operator, ImportHelper):
                                 mod.object = arm
 
                 if hulls and self.collision == "SEPARATE":
-                    hull_obj = build_mesh(d, lod_name + "_collision", hulls, mdir,
-                                          index, opt, missing, nodes, rigid_offsets)
+                    try:
+                        hull_obj = build_mesh(d, lod_name + "_collision", hulls, mdir,
+                                              index, opt, missing, nodes, None, rigid_matrices)
+                    except (BinParseError, struct.error, ValueError, UnboundLocalError) as exc:
+                        print("[SWBH]   collision hull skipped for %s: %s"
+                              % (lod_name, exc))
+                        hull_obj = None
                     if hull_obj:
                         hull_obj.display_type = "WIRE"
                         hull_obj.hide_render = True
@@ -2694,7 +3419,7 @@ class IMPORT_OT_swbh_lvt(bpy.types.Operator, ImportHelper):
     skydome: BoolProperty(name="Include skydome", default=True)
     import_lights: BoolProperty(name="Import lights", default=True)
     import_actors: BoolProperty(
-        name="Import actors/props (experimental)", default=True,
+        name="Import actors/props", default=True,
         description="Places every actor whose class matches a .bin found "
                     "anywhere under the data root")
     actor_skeleton: BoolProperty(
@@ -2704,22 +3429,14 @@ class IMPORT_OT_swbh_lvt(bpy.types.Operator, ImportHelper):
                     "*_base.abin next to their .bin")
     animate_mechanisms: BoolProperty(
         name="Animate rigid mechanisms (doors etc.)", default=True,
-        description="Rigid multi-part mechanisms (doors, etc.) aren't "
-                    "skinned at all - each submesh is tied to one node via "
-                    "an 'id' field instead. Measured on every one seen so "
-                    "far (o_c_smalldoora, o_b_horizontaldoorc/d): their "
-                    "animation is pure translation, no rotation key at all - "
-                    "so each moving part is built as its own plain object "
-                    "under a shared empty and keyframed directly (Location "
-                    "only), with no armature involved at all. A skeletal "
-                    "(armature-based) version was tried twice and reverted "
-                    "twice - first a position bug, then a 90-degree twist, "
-                    "both from edit-bone matrix/roll behaviour that kept "
-                    "not matching what the math predicted. The plain-object "
-                    "path has none of that ambiguity and is the one actually "
-                    "used here. Falls back to the old static, corrected-but-"
-                    "frozen single mesh if any part is missing a usable "
-                    "track")
+        description="Rigid multi-part mechanisms (doors, gates, fans, switches, "
+                    "etc.) are imported with a dedicated mechanism armature. "
+                    "Static node transforms come from the BIN node-matrix "
+                    "table, while ABIN frame 0 overrides only the channels it "
+                    "actually records. This preserves authored rest rotations "
+                    "and pivots and keeps the mechanism convenient to edit "
+                    "and animate in Blender. Translation- and rotation-driven "
+                    "mechanisms are both supported.")
     normals: BoolProperty(
         name="Import normals", default=True,
         description="Use the file's normals as custom split normals. Was "
@@ -2917,17 +3634,235 @@ class IMPORT_OT_swbh_abin(bpy.types.Operator, ImportHelper):
         return {"FINISHED"}
 
 
+
+class IMPORT_OT_swbh_ats(bpy.types.Operator, ImportHelper):
+    """Import a complete ATS-described actor/prop using the existing BIN core."""
+    bl_idname = "import_scene.swbh_ats"
+    bl_label = "Import SWBH Asset (.ats)"
+    bl_options = {"REGISTER", "UNDO"}
+    filename_ext = ".ats"
+    filter_glob: StringProperty(default="*.ats", options={"HIDDEN"})
+
+    scale: FloatProperty(name="Scale", default=1.0, min=0.001, max=1000.0)
+    textures: BoolProperty(name="Find textures", default=True)
+    skeleton: BoolProperty(name="Import skeleton", default=True)
+    animations: BoolProperty(name="Import animations", default=False)
+    collision: BoolProperty(name="Import collision helpers", default=True)
+    vcol: BoolProperty(name="Import vertex colours", default=True)
+    normals: BoolProperty(name="Import normals", default=True)
+
+    def draw(self, context):
+        c = self.layout.column()
+        c.prop(self, "scale")
+        c.prop(self, "textures")
+        c.prop(self, "skeleton")
+        if self.skeleton:
+            c.prop(self, "animations")
+        c.prop(self, "vcol")
+        c.prop(self, "normals")
+        c.prop(self, "collision")
+
+    def execute(self, context):
+        ats_path = self.filepath
+        info = parse_ats(ats_path)
+        root = prefs_root() or find_data_root(os.path.dirname(ats_path)) or ""
+        rel = resolve_ats_asset(ats_path, info, root)
+        bp = rel.get("bin")
+        if not bp:
+            model = info.get("values", {}).get("modelFile", "")
+            self.report({"ERROR"}, "ATS model not found: %s" % model)
+            return {"CANCELLED"}
+
+        before = set(bpy.context.scene.objects)
+        result = bpy.ops.import_scene.swbh_bin(
+            "EXEC_DEFAULT", filepath=bp, files=[], directory=os.path.dirname(bp),
+            whole_area=False, scale=self.scale, flip_v=True, normals=self.normals,
+            vcol=self.vcol, split_parts=False, textures=self.textures,
+            skeleton=self.skeleton, import_animations=self.animations,
+            animate_mechanisms=True, lod="SEPARATE", collision="SEPARATE")
+        if "FINISHED" not in result:
+            return result
+        created = [o for o in bpy.context.scene.objects if o not in before]
+        mesh_objs = [o for o in created if o.type == "MESH"]
+        if not mesh_objs:
+            self.report({"WARNING"}, "BIN imported but no mesh object was created")
+            return {"FINISHED"}
+
+        for obj in created:
+            if obj.type in {"MESH", "ARMATURE"}:
+                apply_asset_metadata(obj, ats_path, info, rel)
+        if rel.get("col") and self.collision:
+            try:
+                helpers = add_collision_visuals(rel["col"], mesh_objs[0], scale=self.scale)
+                print("[SWBH] ATS collision helpers: %d" % len(helpers))
+            except Exception as exc:
+                print("[SWBH] ATS collision import failed: %s" % exc)
+        self.report({"INFO"}, "Imported ATS asset: %s" % info.get("values", {}).get("label", os.path.basename(ats_path)))
+        return {"FINISHED"}
+
+
+class IMPORT_OT_swbh_mat(bpy.types.Operator, ImportHelper):
+    """Create a Blender material directly from a SWBH .mat descriptor."""
+    bl_idname = "import_scene.swbh_mat"
+    bl_label = "Import SWBH Material (.mat)"
+    bl_options = {"REGISTER", "UNDO"}
+    filename_ext = ".mat"
+    filter_glob: StringProperty(default="*.mat", options={"HIDDEN"})
+
+    def execute(self, context):
+        path = self.filepath
+        info = parse_mat(path)
+        root = prefs_root() or find_data_root(os.path.dirname(path)) or ""
+        tex = info.get("diffusemap", "")
+        tex_index = build_index(root)[0] if root and os.path.isdir(root) else {}
+        tex_path = (locate(os.path.splitext(tex)[0], os.path.dirname(path), "textures", TEX_EXTS, tex_index)
+                    if tex else None)
+        mat = make_material(os.path.splitext(os.path.basename(path))[0], tex_path,
+                            info.get("shadertype", ""), False,
+                            metadata=info)
+        mat["swbh_source_mat"] = path
+        bpy.context.view_layer.objects.active = context.active_object if context.active_object else None
+        if context.active_object and context.active_object.type == "MESH":
+            context.active_object.data.materials.append(mat)
+        self.report({"INFO"}, "Created material %s" % mat.name)
+        return {"FINISHED"}
+
+
+class IMPORT_OT_swbh_col(bpy.types.Operator, ImportHelper):
+    """Import a text .col as hidden collision helper empties."""
+    bl_idname = "import_scene.swbh_col"
+    bl_label = "Import SWBH Collision (.col)"
+    bl_options = {"REGISTER", "UNDO"}
+    filename_ext = ".col"
+    filter_glob: StringProperty(default="*.col", options={"HIDDEN"})
+
+    scale: FloatProperty(name="Scale", default=1.0, min=0.001, max=1000.0)
+
+    def execute(self, context):
+        data = parse_col(self.filepath)
+        if data.get("binary"):
+            self.report({"WARNING"}, "Binary .col variant is preserved but not decoded yet")
+            return {"FINISHED"}
+        created = add_collision_visuals(self.filepath, scale=self.scale)
+        self.report({"INFO"}, "Imported %d collision helper(s)" % len(created))
+        return {"FINISHED"}
+
+
+class IMPORT_OT_swbh_aset(bpy.types.Operator, ImportHelper):
+    """Load an ASET and import its referenced ABIN clips onto the active armature."""
+    bl_idname = "import_scene.swbh_aset"
+    bl_label = "Import SWBH Animation Set (.aset)"
+    bl_options = {"REGISTER", "UNDO"}
+    filename_ext = ".aset"
+    filter_glob: StringProperty(default="*.aset", options={"HIDDEN"})
+    fps: FloatProperty(name="Sample rate", default=30.0, min=1.0, max=120.0)
+    scale: FloatProperty(name="Scale", default=1.0, min=0.001, max=1000.0)
+    gap: IntProperty(name="Gap between clips", default=10, min=0)
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object is not None and context.active_object.type == "ARMATURE"
+
+    def execute(self, context):
+        arm = context.active_object
+        if arm is None or arm.type != "ARMATURE":
+            self.report({"ERROR"}, "select an SWBH armature first")
+            return {"CANCELLED"}
+        aset = parse_aset(self.filepath)
+        base_dir = os.path.dirname(self.filepath)
+        root = prefs_root() or find_data_root(base_dir) or ""
+        paths = []
+        for entry in aset["entries"]:
+            ref = entry["path"].replace("\\", os.sep).replace("/", os.sep)
+            candidate = ref if os.path.isabs(ref) else os.path.join(root, ref.lstrip(os.sep)) if root else os.path.join(base_dir, ref)
+            if os.path.isfile(candidate):
+                paths.append(candidate)
+                continue
+            found = find_related(root, os.path.basename(ref), ".abin", preferred_dir=base_dir)
+            if found:
+                paths.append(found)
+        # Include the base clip first when it was explicitly present.
+        unique = []
+        seen = set()
+        for p in paths:
+            key = os.path.abspath(p).lower()
+            if key not in seen:
+                seen.add(key); unique.append(p)
+        if not unique:
+            self.report({"ERROR"}, "no .abin files resolved from ASET")
+            return {"CANCELLED"}
+
+        base = arm.get("swbh_base_abin", "")
+        if not base or not os.path.isfile(base):
+            self.report({"WARNING"}, "armature has no swbh_base_abin; ASET can only apply onto rigs with a known bind pose")
+            return {"CANCELLED"}
+        try:
+            rest_pose = bind_pose_from_abin(base)
+        except (BinParseError, struct.error) as exc:
+            self.report({"ERROR"}, "bind pose: %s" % exc)
+            return {"CANCELLED"}
+        nodes = []
+        idx = {b.name: i for i, b in enumerate(arm.data.bones)}
+        for b in arm.data.bones:
+            nodes.append((b.name, idx[b.parent.name] if b.parent else -1))
+        _track, n_ok, total = import_animation_clips(
+            arm, nodes, rest_pose, unique, self.fps, self.scale, self.gap,
+            arm.name + "_aset", self.report, context=context)
+        if not n_ok:
+            self.report({"ERROR"}, "no ASET animations imported")
+            return {"CANCELLED"}
+        context.scene.frame_start = 1
+        context.scene.frame_end = total
+        arm["swbh_source_aset"] = self.filepath
+        arm["swbh_aset_entries"] = len(aset["entries"])
+        self.report({"INFO"}, "Imported %d/%d ASET animation clips" % (n_ok, len(unique)))
+        return {"FINISHED"}
+
+
+class IMPORT_OT_swbh_lvr(bpy.types.Operator, ImportHelper):
+    """Import actor placement markers from an LVR without rebuilding geometry."""
+    bl_idname = "import_scene.swbh_lvr"
+    bl_label = "Import SWBH Actor Placements (.lvr)"
+    bl_options = {"REGISTER", "UNDO"}
+    filename_ext = ".lvr"
+    filter_glob: StringProperty(default="*.lvr", options={"HIDDEN"})
+    scale: FloatProperty(name="Scale", default=1.0, min=0.001, max=1000.0)
+
+    def execute(self, context):
+        data = parse_lvr(self.filepath)
+        col = get_collection(os.path.splitext(os.path.basename(self.filepath))[0] + "_Actors")
+        made = 0
+        for a in data["actors"]:
+            e = bpy.data.objects.new(a["name"], None)
+            e.empty_display_type = "ARROWS"
+            e.empty_display_size = 0.5
+            x, y, z = a["pos"]
+            e.location = (x * self.scale, y * self.scale, z * self.scale)
+            e.rotation_mode = "QUATERNION"
+            w, qx, qy, qz = a["rot"]
+            e.rotation_quaternion = Quaternion((w, qx, qy, qz))
+            e["swbh_actor_id"] = a["id"]
+            e["swbh_actor_class"] = a["cls"]
+            e["swbh_source_lvr"] = self.filepath
+            e["swbh_areas"] = a.get("areas", [])
+            col.objects.link(e)
+            made += 1
+        self.report({"INFO"}, "Imported %d LVR actor placement marker(s)" % made)
+        return {"FINISHED"}
+
+
 def menu_func_import(self, context):
     self.layout.operator(IMPORT_OT_swbh_bin.bl_idname,
-                         text="SW: Bounty Hunter Mesh (.bin)")
+                         text="SW: Bounty Hunter Model (.bin)")
     self.layout.operator(IMPORT_OT_swbh_lvt.bl_idname,
-                         text="SW: Bounty Hunter Level Area (.lvt)")
+                         text="SW: Bounty Hunter Level (.lvt)")
     self.layout.operator(IMPORT_OT_swbh_abin.bl_idname,
                          text="SW: Bounty Hunter Animation (.abin)")
 
 
-CLASSES = (SWBHPreferences, IMPORT_OT_swbh_bin, IMPORT_OT_swbh_lvt,
-          IMPORT_OT_swbh_abin)
+CLASSES = (SWBHPreferences, IMPORT_OT_swbh_ats, IMPORT_OT_swbh_bin, IMPORT_OT_swbh_lvt,
+          IMPORT_OT_swbh_lvr, IMPORT_OT_swbh_abin, IMPORT_OT_swbh_aset,
+          IMPORT_OT_swbh_mat, IMPORT_OT_swbh_col)
 
 
 def register():
